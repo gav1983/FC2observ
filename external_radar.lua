@@ -8,10 +8,9 @@
     @description
         sends game data to the external radar
 ]]
-local json         = require("json")     -- lib_json
-local modules      = require("modules")  -- lib_modules
-local lib_players  = require("players")  -- lib_players
-local lib_entities = require("entities") -- lib_entities
+local json = require("json")       -- lib_json
+local modules = require("modules") -- lib_modules
+local lib_players = require("players") -- lib_players
 
 local external_radar = {
 
@@ -23,35 +22,15 @@ local external_radar = {
     cache = {
         -- refresh timestamp
         next_data_refresh = 0,
+        next_entity_refresh = 0,
         -- cached data for external radar
-        game_data = {}
-    },
-
-    -- nade types
-    nade_types = {
-        C_SmokeGrenadeProjectile = "smoke",
-        C_HEGrenadeProjectile = "frag",
-        C_FlashbangProjectile = "flashbang",
-        C_MolotovProjectile = "firebomb",
-        C_Inferno = "inferno",
+        game_data = {},
+        -- cached entity data
+        planted_bomb = nil,
+        carried_bomb = nil,
+        projectile_entities = {},
     }
 }
-
-function external_radar.on_scripts_loaded()
-
-    -- setup entity refreshing
-    local requested_classes = {
-        "C_PlantedC4",
-        "C_C4",
-        "C_SmokeGrenadeProjectile",
-        "C_HEGrenadeProjectile",
-        "C_FlashbangProjectile",
-        "C_MolotovProjectile",
-        "C_Inferno"
-    }
-
-    lib_entities.add_entities("external_radar", requested_classes, external_radar.entity_refresh_delay)
-end
 
 function external_radar.on_solution_calibrated(data)
     -- check if calibrated game is CS2
@@ -68,8 +47,111 @@ function external_radar.on_worker(is_calibrated, game_id)
         return
     end
 
+
     -- get current time
     local time = fantasy.time()
+
+    -- check if entity cache should get updated
+    if time > external_radar.cache.next_entity_refresh then
+        -- bomb & projectile variables
+        local planted_bomb = nil
+        local carried_bomb = nil
+        local projectile_entities = {}
+
+        -- loop over entity list to find the bomb and projectile entities
+        for i = 65, modules.entity_list:get_highest_entity_index() do
+            local ent = modules.entity_list:get_entity(i)
+            if not ent then goto continue end
+
+            -- get entity class name
+            local pEntity = ent:read(MEM_ADDRESS, modules.source2:get_schema("CEntityInstance", "m_pEntity"))
+            if not pEntity or not pEntity:is_valid() then goto continue end
+
+            local entity_classinfo = pEntity:read(MEM_ADDRESS, 0x8)
+            if not entity_classinfo or not entity_classinfo:is_valid() then goto continue end
+
+            local ptr1 = entity_classinfo:read(MEM_ADDRESS, 0x28)
+            if not ptr1 or not ptr1:is_valid() then goto continue end
+
+            local ptr2 = ptr1:read(MEM_ADDRESS, 0x8)
+            if not ptr2 or not ptr2:is_valid() then goto continue end
+
+            local class_name = ptr2:read(MEM_STRING, 0, 32)
+            if not class_name or class_name == "" then goto continue end
+
+            -- check if entity is the planted bomb
+            if class_name == "C_PlantedC4" then
+                planted_bomb = ent
+                goto continue
+            end
+
+            -- check if entity is the carried bomb
+            if class_name == "C_C4" then
+                carried_bomb = ent
+                goto continue
+            end
+
+            -- check if entity is a thrown smoke grenade
+            if class_name == "C_SmokeGrenadeProjectile" then
+                table.insert(projectile_entities, {
+                    nade_id = i,
+                    type = "smoke",
+                    entity = ent
+                })
+                goto continue
+            end
+
+            -- check if entity is a thrown HE grenade
+            if class_name == "C_HEGrenadeProjectile" then
+                table.insert(projectile_entities, {
+                    nade_id = i,
+                    type = "frag",
+                    entity = ent
+                })
+                goto continue
+            end
+
+            -- check if entity is a thrown flashbang
+            if class_name == "C_FlashbangProjectile" then
+                table.insert(projectile_entities, {
+                    nade_id = i,
+                    type = "flashbang",
+                    entity = ent
+                })
+                goto continue
+            end
+
+            -- check if entity is a thrown molotov/incendiary
+            if class_name == "C_MolotovProjectile" then
+                table.insert(projectile_entities, {
+                    nade_id = i,
+                    type = "firebomb",
+                    entity = ent
+                })
+                goto continue
+            end
+
+            -- check if entity is a landed molotov/incendiary
+            if class_name == "C_Inferno" then
+                table.insert(projectile_entities, {
+                    nade_id = i,
+                    type = "inferno",
+                    entity = ent
+                })
+                goto continue
+            end
+
+            ::continue::
+        end
+
+        -- save new entity data
+        external_radar.cache.planted_bomb = planted_bomb
+        external_radar.cache.carried_bomb = carried_bomb
+        external_radar.cache.projectile_entities = projectile_entities
+
+        -- setting next timestamp AFTER getting entities
+        external_radar.cache.next_entity_refresh = fantasy.time() + external_radar.entity_refresh_delay
+    end
 
     -- check if game data cache should get updated
     if time < external_radar.cache.next_data_refresh then return end
@@ -97,23 +179,9 @@ function external_radar.on_worker(is_calibrated, game_id)
     end
 
     -- get cached entity data
-    local planted_bomb, carried_bomb, projectile_entities = nil, nil, {}
-    for class_name, entity_table in pairs(lib_entities.get_entities("external_radar")) do
-        if class_name == "C_PlantedC4" then
-            planted_bomb = entity:new(entity_table[1])
-        elseif class_name == "C_C4" then
-            carried_bomb = entity:new(entity_table[1])
-        else
-            local nade_type = external_radar.nade_types[class_name]
-            for _, nade_address in pairs(entity_table) do
-                table.insert(projectile_entities, {
-                    nade_id = string.sub(tostring(nade_address), -8),
-                    type = nade_type,
-                    entity = entity:new(nade_address)
-                })
-            end
-        end
-    end
+    local planted_bomb = external_radar.cache.planted_bomb
+    local carried_bomb = external_radar.cache.carried_bomb
+    local projectile_entities = external_radar.cache.projectile_entities
 
     -- bomb related variables
     local bomb_carrier_entity = nil
